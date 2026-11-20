@@ -24,8 +24,8 @@ jobs:
         run: |
           $sourceDir = Join-Path $env:GITHUB_WORKSPACE ".github/manye-pc-source-v1.0.2"
           $parts = Get-ChildItem $sourceDir -Filter "*.b64" | Sort-Object Name
-          if ($parts.Count -ne 32) {
-            throw "Expected 32 verified source segments, found $($parts.Count)"
+          if ($parts.Count -ne 26) {
+            throw "Expected 26 verified source segments, found $($parts.Count)"
           }
           $joined = ($parts | ForEach-Object { (Get-Content $_.FullName -Raw).Trim() }) -join ""
           if ($joined.Length -ne 90484) {
