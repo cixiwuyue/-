@@ -1,0 +1,158 @@
+name: Build Manye PC Windows portable
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/manye-pc-source-v1.0.2/**"
+      - ".github/workflows/build-manye-pc.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout private project
+        uses: actions/checkout@v4
+
+      - name: Rebuild source ZIP from verified segments
+        shell: pwsh
+        run: |
+          $sourceDir = Join-Path $env:GITHUB_WORKSPACE ".github/manye-pc-source-v1.0.2"
+          $parts = Get-ChildItem $sourceDir -Filter "*.b64" | Sort-Object Name
+          if ($parts.Count -ne 32) {
+            throw "Expected 32 verified source segments, found $($parts.Count)"
+          }
+          $joined = ($parts | ForEach-Object { (Get-Content $_.FullName -Raw).Trim() }) -join ""
+          if ($joined.Length -ne 90484) {
+            throw "Source Base64 length mismatch: $($joined.Length)"
+          }
+          $zipBytes = [Convert]::FromBase64String($joined)
+          $sourceZip = Join-Path $env:RUNNER_TEMP "Manye-PC-source.zip"
+          [IO.File]::WriteAllBytes($sourceZip, $zipBytes)
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead($sourceZip)
+          try {
+            $entryNames = @($archive.Entries | ForEach-Object { $_.FullName })
+            if (!($entryNames -contains "Manye-PC/run_manye.py")) {
+              throw "Source archive validation failed: run_manye.py missing"
+            }
+            if (!($entryNames -contains "Manye-PC/manye_pc/app.py")) {
+              throw "Source archive validation failed: app.py missing"
+            }
+          } finally {
+            $archive.Dispose()
+          }
+          $extractDir = Join-Path $env:RUNNER_TEMP "Manye-PC-source"
+          Expand-Archive -LiteralPath $sourceZip -DestinationPath $extractDir -Force
+          $projectDir = Join-Path $extractDir "Manye-PC"
+          if (!(Test-Path (Join-Path $projectDir "run_manye.py"))) {
+            throw "Source project folder was not extracted correctly"
+          }
+          "MANYE_PROJECT_DIR=$projectDir" >> $env:GITHUB_ENV
+
+      - name: Set up bundled build Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: "x64"
+
+      - name: Install app and build dependencies
+        shell: pwsh
+        run: |
+          Set-Location $env:MANYE_PROJECT_DIR
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Run project tests
+        shell: pwsh
+        run: |
+          Set-Location $env:MANYE_PROJECT_DIR
+          python -m compileall -q manye_pc tests
+          python tests/test_pc_project.py
+          if ($LASTEXITCODE -ne 0) { throw "PC project tests failed" }
+          python tests/test_android_native_format.py
+          if ($LASTEXITCODE -ne 0) { throw "Android-format compatibility tests failed" }
+
+      - name: Build one-file portable EXE
+        shell: pwsh
+        run: |
+          Set-Location $env:MANYE_PROJECT_DIR
+          python -m PyInstaller --clean --noconfirm --onefile --windowed --name "万叶" --icon "manye_pc\assets\manye.ico" --add-data "manye_pc\assets;manye_pc\assets" --collect-all cryptography --collect-all PIL --hidden-import PIL.ImageTk run_manye.py
+          $exe = Join-Path $env:MANYE_PROJECT_DIR "dist\万叶.exe"
+          if (!(Test-Path $exe)) { throw "PyInstaller did not produce 万叶.exe" }
+          $exeInfo = Get-Item $exe
+          if ($exeInfo.Length -lt 10000000) {
+            throw "EXE unexpectedly small ($($exeInfo.Length) bytes); refusing to package"
+          }
+          $header = [IO.File]::ReadAllBytes($exe)
+          if ($header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
+            throw "Output is not a Windows PE executable (missing MZ header)"
+          }
+          $proc = Start-Process -FilePath $exe -ArgumentList "--self-test" -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) {
+            $selfTestLog = Join-Path $env:TEMP "Manye-exe-self-test.log"
+            if (Test-Path $selfTestLog) {
+              Get-Content $selfTestLog -Raw | Write-Error
+            }
+            throw "Packaged EXE self-test failed with exit code $($proc.ExitCode)"
+          }
+          $stage = Join-Path $env:RUNNER_TEMP "Manye-Windows-Portable"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item $exe (Join-Path $stage "万叶.exe")
+          Copy-Item (Join-Path $env:MANYE_PROJECT_DIR "PC端使用说明.txt") $stage
+          $releaseZip = Join-Path $env:GITHUB_WORKSPACE "Manye-Windows-免安装版-v1.0.2.zip"
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $releaseZip -CompressionLevel Optimal
+          $package = [IO.Compression.ZipFile]::OpenRead($releaseZip)
+          try {
+            if (!($package.Entries.FullName -contains "万叶.exe")) {
+              throw "Portable package is missing 万叶.exe"
+            }
+          } finally {
+            $package.Dispose()
+          }
+          "EXE_BYTES=$($exeInfo.Length)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "PACKAGE_BYTES=$((Get-Item $releaseZip).Length)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload portable Windows package
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: manye-pc-windows-portable-v1.0.2
+          path: Manye-Windows-免安装版-v1.0.2.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Save private artifact pointer
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const result = {
+              version: "1.0.2",
+              run_id: context.runId,
+              artifact_id: Number("${{ steps.upload.outputs.artifact-id }}"),
+              artifact_name: "manye-pc-windows-portable-v1.0.2",
+              source_commit: context.sha,
+              created_at: new Date().toISOString()
+            };
+            const path = ".github/manye-pc-build-result.json";
+            const content = Buffer.from(JSON.stringify(result, null, 2)).toString("base64");
+            let sha;
+            try {
+              const old = await github.rest.repos.getContent({
+                owner: context.repo.owner, repo: context.repo.repo, path, ref: "main"
+              });
+              sha = old.data.sha;
+            } catch (error) {}
+            await github.rest.repos.createOrUpdateFileContents({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              path,
+              message: "Record Manye PC portable Windows build artifact",
+              content,
+              ...(sha ? { sha } : {})
+            });
