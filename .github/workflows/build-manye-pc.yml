@@ -68,6 +68,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-build.txt
 
+      - name: Apply Windows path normalization fix
+        shell: pwsh
+        run: |
+          Set-Location $env:MANYE_PROJECT_DIR
+          $file = Join-Path $env:MANYE_PROJECT_DIR "manye_pc\backup.py"
+          $source = [IO.File]::ReadAllText($file, [Text.Encoding]::UTF8)
+          $oldLine = "rel = target_file.relative_to(target_folder).as_posix()"
+          $newLine = "rel = (Path(rel).parent / target_file.name).as_posix()"
+          if (!$source.Contains($oldLine)) {
+            throw "Expected Windows-affected path calculation was not found"
+          }
+          $source = $source.Replace($oldLine, $newLine)
+          [IO.File]::WriteAllText($file, $source, [Text.UTF8Encoding]::new($false))
+
       - name: Run project tests
         shell: pwsh
         run: |
